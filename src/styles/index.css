@@ -44,7 +44,7 @@ html, body {
 
 .game-canvas-container {
   position: relative;
-  width: min(100vw, 520px);
+  width: min(100vw, 720px);
   height: 100%;
 }
 
@@ -54,6 +54,29 @@ html, body {
   height: 100%;
 }
 
+/* ---------- floating combo/score text (DOM overlay above the WebGL canvas) ---------- */
+
+.fx-layer {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  overflow: visible;
+  z-index: 4;
+}
+
+.fx-combo-text {
+  position: absolute;
+  transform: translate(-50%, -50%);
+  color: #fff;
+  font-weight: 800;
+  font-size: clamp(14px, 3.6vw, 19px);
+  text-shadow: 0 2px 6px rgba(20, 15, 36, 0.55), 0 0 3px rgba(20, 15, 36, 0.85);
+  white-space: nowrap;
+  opacity: 1;
+  transition: transform 0.6s ease-out, opacity 0.6s ease-out;
+  will-change: transform, opacity;
+}
+
 /* ---------- HUD ---------- */
 
 .hud {
@@ -61,7 +84,7 @@ html, body {
   top: 0;
   left: 50%;
   transform: translateX(-50%);
-  width: min(100vw, 520px);
+  width: min(100vw, 720px);
   display: flex;
   gap: 10px;
   padding: max(10px, env(safe-area-inset-top)) 14px 10px;
@@ -91,7 +114,7 @@ html, body {
 
 .hud-value {
   display: block;
-  font-size: 18px;
+  font-size: clamp(15px, 3.6vw, 20px);
   font-weight: 800;
   font-variant-numeric: tabular-nums;
 }
@@ -124,13 +147,13 @@ html, body {
 
 .icon-btn {
   position: relative;
-  width: 40px;
-  height: 40px;
+  width: clamp(36px, 9vw, 44px);
+  height: clamp(36px, 9vw, 44px);
   border-radius: 50%;
   border: 1px solid rgba(255, 255, 255, 0.12);
   background: rgba(255, 255, 255, 0.08);
   color: var(--ink);
-  font-size: 15px;
+  font-size: clamp(13px, 3.2vw, 16px);
   cursor: pointer;
   display: flex;
   align-items: center;
@@ -181,7 +204,7 @@ html, body {
 }
 
 .title {
-  font-size: 46px;
+  font-size: clamp(32px, 9vw, 52px);
   font-weight: 800;
   letter-spacing: -0.02em;
   background: linear-gradient(135deg, var(--accent-pink), var(--accent-blue), var(--accent-yellow));
@@ -191,23 +214,23 @@ html, body {
 }
 
 .subtitle {
-  font-size: 16px;
+  font-size: clamp(13px, 3.4vw, 17px);
   opacity: 0.85;
   max-width: 320px;
 }
 
 .hint, .offline-hint {
-  font-size: 12px;
+  font-size: clamp(11px, 2.8vw, 13px);
   opacity: 0.55;
   max-width: 300px;
 }
 
 .primary-btn {
   margin-top: 6px;
-  padding: 14px 46px;
+  padding: clamp(12px, 3vw, 16px) clamp(32px, 9vw, 50px);
   border-radius: 999px;
   border: none;
-  font-size: 18px;
+  font-size: clamp(15px, 3.6vw, 19px);
   font-weight: 800;
   color: #140f24;
   background: linear-gradient(135deg, var(--accent-orange), var(--accent-pink));
@@ -247,4 +270,34 @@ html, body {
   opacity: 0.6;
   text-transform: uppercase;
   letter-spacing: 0.04em;
+}
+
+/* ---------- short viewports (landscape phones) ---------- */
+
+@media (max-height: 480px) {
+  .hud {
+    padding-top: max(6px, env(safe-area-inset-top));
+  }
+
+  .hud-combo {
+    top: 52px;
+  }
+
+  .screen {
+    gap: 6px;
+    padding: 14px;
+  }
+
+  .title {
+    font-size: clamp(24px, 7vw, 34px);
+  }
+
+  .stats-recap {
+    margin-top: 0;
+  }
+
+  .stat-block {
+    padding: 6px 14px;
+    min-width: 84px;
+  }
 }

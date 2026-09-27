@@ -1,14 +1,19 @@
-import { Application, Container, Graphics, Sprite, Text } from 'pixi.js';
+import * as THREE from 'three';
 import { HexGrid } from './grid.js';
 import { popMatchesAt, popBomb, dropFloatingBubbles } from './matcher.js';
 import { Aimer, Projectile, findGridCollision, predictBouncePath } from './shooter.js';
 import { TweenManager, lerp } from './tween.js';
-import { buildTextureAtlas, COLORS } from './textures.js';
+import { buildBubbleAssets, disposeBubbleAssets, COLORS } from './materials.js';
 import { Audio } from './audio.js';
 import { getHighScore, submitScore, touchDailyStreak } from './storage.js';
 
-const COLS = 8;
-const PREFILL_ROWS = 5;
+const IDEAL_CELL_PX = 46;
+const MIN_COLS = 7;
+const MAX_COLS = 13;
+const DEFAULT_COLS = 9;
+const MIN_PREFILL_ROWS = 4;
+const MAX_PREFILL_ROWS = 10;
+const PREFILL_FILL_RATIO = 0.42;
 const INITIAL_COLORS = 4;
 const INITIAL_ROW_INTERVAL = 14000;
 const MIN_ROW_INTERVAL = 5000;
@@ -16,121 +21,280 @@ const ROW_INTERVAL_STEP = 450;
 const POWERUP_START_SCORE = 300;
 const INITIAL_SHUFFLES = 3;
 
-function hexToInt(color) {
-  return Number('0x' + color.replace('#', ''));
+const CAMERA_FOV = 42;
+const TILT_ANGLE = THREE.MathUtils.degToRad(16);
+const AIM_DOT_COUNT = 64;
+
+function clamp(v, min, max) {
+  return Math.min(max, Math.max(min, v));
 }
 
 /**
- * Owns the PIXI.Application and the whole game simulation. React never
+ * Owns the Three.js renderer/scene and the whole game simulation. React never
  * touches this loop directly — it creates one instance, calls start()/
  * shuffleCurrentBubble()/setMuted() from UI event handlers, and reads
  * game state only through the callbacks below (which the caller wires to
- * the Zustand store). This keeps the 60fps loop entirely inside PixiJS's
- * own ticker, untouched by React's render cycle.
+ * the Zustand store). This keeps the 60fps loop entirely inside Three.js's
+ * own animation loop, untouched by React's render cycle.
+ *
+ * Gameplay (grid, matching, shooter physics) is computed entirely in flat
+ * 2D pixel coordinates, exactly like the previous 2D renderer — only the
+ * final positions get projected into a tilted 3D scene via pixelToWorld().
+ * That keeps aiming/collision math simple while the board still renders as
+ * lit, shaded 3D spheres viewed from a slightly tilted "arcade" camera.
  */
 export class GameEngine {
   constructor(container, callbacks = {}) {
     this.container = container;
     this.callbacks = callbacks; // onScore, onBest, onStreak, onCombo, onShuffles, onGameOver
-    this.app = null;
     this.destroyed = false;
     this.state = 'idle'; // 'idle' | 'playing' | 'gameover'
-    this.sprites = new Map(); // "r,c" -> Sprite
+    this.meshes = new Map(); // "r,c" -> Mesh
     this.tweens = new TweenManager();
     this.particles = [];
     this.audio = new Audio();
     this.aimer = new Aimer();
     this.pointerActive = false;
+    this.cols = null;
     this._onKeyDown = this._onKeyDown.bind(this);
   }
 
   async init() {
-    const app = new Application();
-    await app.init({ resizeTo: this.container, backgroundAlpha: 0, antialias: true });
+    const rect = this.container.getBoundingClientRect();
+    this.width = Math.max(1, Math.round(rect.width));
+    this.height = Math.max(1, Math.round(rect.height));
+
+    this.renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true, powerPreference: 'high-performance' });
+    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+    this.renderer.shadowMap.enabled = true;
+    this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    this.renderer.outputColorSpace = THREE.SRGBColorSpace;
+    this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    this.renderer.toneMappingExposure = 1.15;
+
     if (this.destroyed) {
-      app.destroy(true);
+      this.renderer.dispose();
       return;
     }
-    this.app = app;
-    this.container.appendChild(app.canvas);
 
-    this.worldContainer = new Container();
-    this.killLineGraphics = new Graphics();
-    this.gridLayer = new Container();
-    this.effectsLayer = new Container();
-    this.aimGraphics = new Graphics();
-    this.shooterLayer = new Container();
-    this.worldContainer.addChild(
-      this.killLineGraphics, this.gridLayer, this.effectsLayer, this.aimGraphics, this.shooterLayer
-    );
-    app.stage.addChild(this.worldContainer);
+    this.renderer.domElement.style.touchAction = 'none';
+    this.container.appendChild(this.renderer.domElement);
+
+    this.fxLayer = document.createElement('div');
+    this.fxLayer.className = 'fx-layer';
+    this.container.appendChild(this.fxLayer);
+
+    this.scene = new THREE.Scene();
+    this.scene.fog = new THREE.Fog(0x0e0a1c, 400, 1800);
+
+    this.camera = new THREE.PerspectiveCamera(CAMERA_FOV, this.width / this.height, 1, 5000);
+    this.camera.position.set(0, 0, 600);
+    this.camera.lookAt(0, 0, 0);
+
+    const hemi = new THREE.HemisphereLight(0x8fd6ff, 0x140f24, 0.85);
+    this.scene.add(hemi);
+
+    const key = new THREE.DirectionalLight(0xfff3e0, 1.35);
+    key.castShadow = true;
+    const shadowSize = this.width < 480 ? 512 : 1024;
+    key.shadow.mapSize.set(shadowSize, shadowSize);
+    key.shadow.bias = -0.0015;
+    key.shadow.normalBias = 0.025; // bubbles are curved spheres — normalBias avoids acne PCF bias alone can't fix
+    this.scene.add(key);
+    this.scene.add(key.target);
+    this.keyLight = key;
+
+    this.boardGroup = new THREE.Group();
+    this.boardGroup.rotation.x = -TILT_ANGLE;
+    this.scene.add(this.boardGroup);
+
+    const shadowMat = new THREE.ShadowMaterial({ opacity: 0.32 });
+    this.shadowPlane = new THREE.Mesh(new THREE.PlaneGeometry(4000, 4000), shadowMat);
+    this.shadowPlane.position.z = -60;
+    this.shadowPlane.receiveShadow = true;
+    this.boardGroup.add(this.shadowPlane);
+
+    this.assets = buildBubbleAssets();
+
+    this.currentMesh = new THREE.Mesh(this.assets.geometry, this.assets.materials.get(COLORS[0]));
+    this.currentMesh.castShadow = true;
+    this.currentMesh.receiveShadow = true;
+    this.nextMesh = new THREE.Mesh(this.assets.geometry, this.assets.materials.get(COLORS[0]));
+    this.nextMesh.castShadow = true;
+    this.boardGroup.add(this.currentMesh, this.nextMesh);
+
+    this.cannonGroup = this._buildCannon();
+    this.boardGroup.add(this.cannonGroup);
+
+    // A single Points object for the whole aim-trajectory preview (one draw
+    // call for up to AIM_DOT_COUNT dots, instead of one Mesh per dot).
+    const aimGeo = new THREE.BufferGeometry();
+    this._aimPositions = new Float32Array(AIM_DOT_COUNT * 3);
+    aimGeo.setAttribute('position', new THREE.BufferAttribute(this._aimPositions, 3));
+    aimGeo.setDrawRange(0, 0);
+    const aimMat = new THREE.PointsMaterial({
+      color: 0xffffff, size: 6, sizeAttenuation: true, transparent: true, opacity: 0.6, depthWrite: false,
+    });
+    this._aimPoints = new THREE.Points(aimGeo, aimMat);
+    this.boardGroup.add(this._aimPoints);
+
+    const killMat = new THREE.MeshBasicMaterial({ color: 0xff5d73, transparent: true, opacity: 0.25 });
+    this.killLineMesh = new THREE.Mesh(new THREE.PlaneGeometry(1, 3), killMat);
+    this.boardGroup.add(this.killLineMesh);
 
     this._computeLayout();
-    this.textures = buildTextureAtlas(app, this.cellSize / 2);
-
-    this.currentSprite = new Sprite(this.textures.get(COLORS[0]));
-    this.currentSprite.anchor.set(0.5);
-    this.nextSprite = new Sprite(this.textures.get(COLORS[0]));
-    this.nextSprite.anchor.set(0.5);
-    this.shooterLayer.addChild(this.currentSprite, this.nextSprite);
-
     this._bindInput();
 
     this._resizeObserver = new ResizeObserver(() => this._computeLayout(true));
     this._resizeObserver.observe(this.container);
 
-    app.ticker.add((ticker) => this._tick(ticker.deltaMS / 1000));
+    this._lastTime = performance.now();
+    this.renderer.setAnimationLoop(() => this._frame());
+  }
+
+  // ---------- decorative shooter cannon ----------
+
+  _buildCannon() {
+    const group = new THREE.Group();
+    const baseMat = new THREE.MeshStandardMaterial({ color: 0x2b2540, roughness: 0.5, metalness: 0.3 });
+    const base = new THREE.Mesh(new THREE.CylinderGeometry(1, 1.15, 0.5, 20), baseMat);
+    base.rotation.x = Math.PI / 2;
+    base.castShadow = true;
+    base.receiveShadow = true;
+    group.add(base);
+
+    const barrelMat = new THREE.MeshStandardMaterial({ color: 0x4a3f6b, roughness: 0.35, metalness: 0.4 });
+    const barrel = new THREE.Mesh(new THREE.CylinderGeometry(0.42, 0.5, 1.6, 16), barrelMat);
+    barrel.position.y = 0.7;
+    barrel.castShadow = true;
+    group.add(barrel);
+
+    group.scale.setScalar(22);
+    return group;
+  }
+
+  // ---------- coordinate bridge (2D pixel-space game <-> tilted 3D scene) ----------
+
+  pixelToWorld(x, y, z = 0) {
+    return new THREE.Vector3(x - this.width / 2, this.height / 2 - y, z);
+  }
+
+  _bubbleZJitter(r, c) {
+    const h = Math.sin(r * 12.9898 + c * 78.233) * 43758.5453;
+    return (h - Math.floor(h) - 0.5) * 8;
+  }
+
+  _worldToScreen(worldPos) {
+    const v = worldPos.clone().project(this.camera);
+    return {
+      x: (v.x * 0.5 + 0.5) * this.width,
+      y: (-v.y * 0.5 + 0.5) * this.height,
+    };
   }
 
   // ---------- layout ----------
 
+  _computeBoardShape() {
+    const rect = this.container.getBoundingClientRect();
+    const w = Math.max(1, Math.round(rect.width));
+    this.cols = clamp(Math.round(w / IDEAL_CELL_PX), MIN_COLS, MAX_COLS);
+  }
+
+  _computePrefillRows() {
+    const rowHeight = this.cellSize * 0.87;
+    const playHeight = Math.max(0, this.killLineY - this.topY);
+    const rows = Math.round((playHeight * PREFILL_FILL_RATIO) / rowHeight);
+    return clamp(rows, MIN_PREFILL_ROWS, MAX_PREFILL_ROWS);
+  }
+
   _computeLayout(relayout = false) {
-    const w = this.app.screen.width;
-    const h = this.app.screen.height;
+    const rect = this.container.getBoundingClientRect();
+    const w = Math.max(1, Math.round(rect.width));
+    const h = Math.max(1, Math.round(rect.height));
     this.width = w;
     this.height = h;
-    this.cellSize = w / COLS;
+
+    const cols = this.cols || DEFAULT_COLS;
+    this.cellSize = w / cols;
     this.boardLeft = 0;
     this.boardRight = w;
-    this.topY = 96;
-    this.killLineY = h - 120;
+    this.topY = Math.max(64, h * 0.11);
+    this.killLineY = h - Math.max(92, h * 0.15);
     this.shooterX = w / 2;
-    this.shooterY = h - 70;
+    this.shooterY = h - Math.max(54, h * 0.09);
+
+    this.renderer.setSize(w, h, false);
+    this.camera.aspect = w / h;
+    const dist = h / 2 / Math.tan(THREE.MathUtils.degToRad(CAMERA_FOV) / 2);
+    this.camera.position.z = dist;
+    this.camera.near = Math.max(1, dist * 0.05);
+    this.camera.far = dist * 4;
+    this.camera.updateProjectionMatrix();
+
+    if (this.scene?.fog) {
+      this.scene.fog.near = dist * 0.55;
+      this.scene.fog.far = dist * 2.4;
+    }
+
+    if (this.keyLight) {
+      this.keyLight.position.set(w * 0.1, h * 0.28, dist * 1.15);
+      this.keyLight.target.position.set(0, -h * 0.05, 0);
+      this.keyLight.target.updateMatrixWorld();
+      const frustum = Math.max(w, h) * 0.75;
+      this.keyLight.shadow.camera.left = -frustum;
+      this.keyLight.shadow.camera.right = frustum;
+      this.keyLight.shadow.camera.top = frustum;
+      this.keyLight.shadow.camera.bottom = -frustum;
+      this.keyLight.shadow.camera.near = dist * 0.2;
+      this.keyLight.shadow.camera.far = dist * 3.2;
+      this.keyLight.shadow.camera.updateProjectionMatrix();
+    }
 
     if (this.grid) {
       this.grid.cellSize = this.cellSize;
       this.grid.rowHeight = this.cellSize * 0.87;
       this.grid.boardLeft = this.boardLeft;
       this.grid.topY = this.topY;
-      if (relayout) this._relayoutSprites();
+      if (relayout) this._relayoutMeshes();
     }
-    if (this.currentSprite) {
-      const diameter = this.cellSize - 3;
-      this.currentSprite.position.set(this.shooterX, this.shooterY);
-      this.currentSprite.width = diameter;
-      this.currentSprite.height = diameter;
-      this.nextSprite.position.set(this.shooterX + this.cellSize * 1.4, this.shooterY);
-      this.nextSprite.width = this.cellSize * 0.66;
-      this.nextSprite.height = this.cellSize * 0.66;
+
+    this._layoutShooterMeshes();
+  }
+
+  _relayoutMeshes() {
+    const radius = (this.cellSize - 3) / 2;
+    for (const [key, mesh] of this.meshes) {
+      const [r, c] = key.split(',').map(Number);
+      const { x, y } = this.grid.cellCenter(r, c);
+      const p = this.pixelToWorld(x, y, mesh.position.z);
+      mesh.position.x = p.x;
+      mesh.position.y = p.y;
+      mesh.scale.setScalar(radius);
     }
   }
 
-  _relayoutSprites() {
-    const diameter = this.cellSize - 3;
-    for (const [key, sprite] of this.sprites) {
-      const [r, c] = key.split(',').map(Number);
-      const { x, y } = this.grid.cellCenter(r, c);
-      sprite.position.set(x, y);
-      sprite.width = diameter;
-      sprite.height = diameter;
+  _layoutShooterMeshes() {
+    if (!this.currentMesh) return;
+    const radius = (this.cellSize - 3) / 2;
+    const p = this.pixelToWorld(this.shooterX, this.shooterY, 6);
+    this.currentMesh.position.copy(p);
+    this.currentMesh.scale.setScalar(radius);
+
+    const nextRadius = this.cellSize * 0.33;
+    const p2 = this.pixelToWorld(this.shooterX + this.cellSize * 1.4, this.shooterY, 6);
+    this.nextMesh.position.copy(p2);
+    this.nextMesh.scale.setScalar(nextRadius);
+
+    if (this.cannonGroup) {
+      const cp = this.pixelToWorld(this.shooterX, this.shooterY, 2);
+      this.cannonGroup.position.copy(cp);
     }
   }
 
   // ---------- input ----------
 
   _bindInput() {
-    const canvas = this.app.canvas;
-    canvas.style.touchAction = 'none';
+    const canvas = this.renderer.domElement;
 
     const getPos = (e) => {
       const rect = canvas.getBoundingClientRect();
@@ -170,13 +334,19 @@ export class GameEngine {
     if (this.state !== 'playing') return;
     if (e.key === 'ArrowLeft') this.aimer.nudge(-0.05);
     else if (e.key === 'ArrowRight') this.aimer.nudge(0.05);
-    else if (e.key === ' ') { e.preventDefault(); this.shoot(); }
+    else if (e.key === ' ') {
+      e.preventDefault();
+      this.shoot();
+    }
   }
 
   // ---------- lifecycle ----------
 
   start() {
-    this.grid = new HexGrid(COLS, this.cellSize, this.boardLeft, this.topY);
+    this._computeBoardShape();
+    this._computeLayout();
+
+    this.grid = new HexGrid(this.cols, this.cellSize, this.boardLeft, this.topY);
     this.score = 0;
     this.combo = 0;
     this.bestCombo = 0;
@@ -188,29 +358,39 @@ export class GameEngine {
     this.gameOverTriggered = false;
     this.shuffles = INITIAL_SHUFFLES;
 
-    for (const sprite of this.sprites.values()) sprite.destroy();
-    this.sprites.clear();
-    this.gridLayer.removeChildren();
-    this.effectsLayer.removeChildren();
-    if (this.projectileSprite) { this.projectileSprite.destroy(); this.projectileSprite = null; }
+    for (const mesh of this.meshes.values()) {
+      this.boardGroup.remove(mesh);
+      mesh.material.dispose();
+    }
+    this.meshes.clear();
+    if (this.projectileMesh) {
+      this.boardGroup.remove(this.projectileMesh);
+      this.projectileMesh = null;
+    }
     this.tweens = new TweenManager();
+    for (const p of this.particles) {
+      this.boardGroup.remove(p.sprite);
+      p.sprite.material.dispose();
+    }
     this.particles = [];
-    this.worldContainer.position.set(0, 0);
+    this.boardGroup.position.set(0, 0, 0);
 
-    for (let r = 0; r < PREFILL_ROWS; r++) {
+    const prefillRows = this._computePrefillRows();
+    for (let r = 0; r < prefillRows; r++) {
       const cols = this.grid.colsInRow(r);
       const row = [];
       for (let c = 0; c < cols; c++) {
         const cell = { color: this._randomColor() };
         row.push(cell);
-        this._createSprite(r, c, cell);
+        this._createBubbleMesh(r, c, cell);
       }
       this.grid.rows[r] = row;
     }
 
     this.currentBubble = this._spawnBubble();
     this.nextBubble = this._spawnBubble();
-    this._updateShooterSprites();
+    this._updateShooterMeshes();
+    this._layoutShooterMeshes();
 
     const streak = touchDailyStreak();
     const best = getHighScore();
@@ -229,18 +409,19 @@ export class GameEngine {
       this.shooterX, this.shooterY, this.aimer.angle,
       this.currentBubble.color, this.currentBubble.type, this.cellSize / 2
     );
-    const diameter = this.cellSize - 3;
-    this.projectileSprite = new Sprite(this.textures.get(this.currentBubble.type || this.currentBubble.color));
-    this.projectileSprite.anchor.set(0.5);
-    this.projectileSprite.width = diameter;
-    this.projectileSprite.height = diameter;
-    this.projectileSprite.position.set(this.projectile.x, this.projectile.y);
-    this.gridLayer.addChild(this.projectileSprite);
+    const key = this.currentBubble.type || this.currentBubble.color;
+    this.projectileMesh = new THREE.Mesh(this.assets.geometry, this.assets.materials.get(key));
+    this.projectileMesh.castShadow = true;
+    const radius = (this.cellSize - 3) / 2;
+    this.projectileMesh.scale.setScalar(radius);
+    const p = this.pixelToWorld(this.projectile.x, this.projectile.y, 6);
+    this.projectileMesh.position.copy(p);
+    this.boardGroup.add(this.projectileMesh);
     this.audio.shoot();
 
     this.currentBubble = this.nextBubble;
     this.nextBubble = this._spawnBubble();
-    this._updateShooterSprites();
+    this._updateShooterMeshes();
   }
 
   shuffleCurrentBubble() {
@@ -249,7 +430,7 @@ export class GameEngine {
     const pool = palette.length ? palette : this._boardColors();
     this.currentBubble = { color: pool[Math.floor(Math.random() * pool.length)] };
     this.shuffles -= 1;
-    this._updateShooterSprites();
+    this._updateShooterMeshes();
     this.callbacks.onShuffles?.(this.shuffles);
     this.audio.tone(700, 0.08, 'sine', 0.08);
   }
@@ -281,111 +462,136 @@ export class GameEngine {
     return { color: palette[Math.floor(Math.random() * palette.length)] };
   }
 
-  _updateShooterSprites() {
-    const diameter = this.cellSize - 3;
-    this.currentSprite.texture = this.textures.get(this.currentBubble.type || this.currentBubble.color);
-    this.currentSprite.width = diameter;
-    this.currentSprite.height = diameter;
-    const nextDiameter = this.cellSize * 0.66;
-    this.nextSprite.texture = this.textures.get(this.nextBubble.type || this.nextBubble.color);
-    this.nextSprite.width = nextDiameter;
-    this.nextSprite.height = nextDiameter;
+  _updateShooterMeshes() {
+    const radius = (this.cellSize - 3) / 2;
+    this.currentMesh.material = this.assets.materials.get(this.currentBubble.type || this.currentBubble.color);
+    this.currentMesh.scale.setScalar(radius);
+    const nextRadius = this.cellSize * 0.33;
+    this.nextMesh.material = this.assets.materials.get(this.nextBubble.type || this.nextBubble.color);
+    this.nextMesh.scale.setScalar(nextRadius);
   }
 
-  // ---------- sprite <-> grid sync ----------
+  // ---------- mesh <-> grid sync ----------
 
-  _createSprite(r, c, cell) {
-    const tex = this.textures.get(cell.type || cell.color);
-    const sprite = new Sprite(tex);
-    sprite.anchor.set(0.5);
-    const diameter = this.cellSize - 3;
-    sprite.width = diameter;
-    sprite.height = diameter;
+  _createBubbleMesh(r, c, cell) {
+    const key = cell.type || cell.color;
+    const baseMat = this.assets.materials.get(key);
+    const material = baseMat.clone();
+    material.transparent = true;
+    const mesh = new THREE.Mesh(this.assets.geometry, material);
+    mesh.castShadow = true;
+    mesh.receiveShadow = true;
+    const radius = (this.cellSize - 3) / 2;
+    mesh.scale.setScalar(radius);
     const { x, y } = this.grid.cellCenter(r, c);
-    sprite.position.set(x, y);
-    sprite.bubbleColor = cell.color;
-    this.gridLayer.addChild(sprite);
-    this.sprites.set(`${r},${c}`, sprite);
-    return sprite;
+    const p = this.pixelToWorld(x, y, this._bubbleZJitter(r, c));
+    mesh.position.copy(p);
+    mesh.userData.color = cell.color;
+    this.boardGroup.add(mesh);
+    this.meshes.set(`${r},${c}`, mesh);
+    return mesh;
   }
 
-  _popSpriteAt(r, c) {
+  _popMeshAt(r, c) {
     const key = `${r},${c}`;
-    const sprite = this.sprites.get(key);
-    if (!sprite) return;
-    this.sprites.delete(key);
-    this._burstParticles(sprite.x, sprite.y, hexToInt(sprite.bubbleColor || '#ffffff'), 8);
-    const startScale = sprite.scale.x;
+    const mesh = this.meshes.get(key);
+    if (!mesh) return;
+    this.meshes.delete(key);
+    this._burstParticles(mesh.position.clone(), mesh.userData.color || '#ffffff', 8);
+    const startScale = mesh.scale.x;
     this.tweens.add({
       duration: 0.16,
       onUpdate: (t) => {
-        sprite.scale.set(lerp(startScale, startScale * 1.5, t));
-        sprite.alpha = 1 - t;
+        mesh.scale.setScalar(lerp(startScale, startScale * 1.5, t));
+        mesh.material.opacity = 1 - t;
       },
-      onComplete: () => sprite.destroy(),
+      onComplete: () => {
+        this.boardGroup.remove(mesh);
+        mesh.material.dispose();
+      },
     });
   }
 
-  _dropSpriteAt(r, c) {
+  _dropMeshAt(r, c) {
     const key = `${r},${c}`;
-    const sprite = this.sprites.get(key);
-    if (!sprite) return;
-    this.sprites.delete(key);
-    this._burstParticles(sprite.x, sprite.y, hexToInt(sprite.bubbleColor || '#ffd76a'), 5);
-    const startY = sprite.y;
+    const mesh = this.meshes.get(key);
+    if (!mesh) return;
+    this.meshes.delete(key);
+    this._burstParticles(mesh.position.clone(), mesh.userData.color || '#ffd76a', 5);
+    const startY = mesh.position.y;
     this.tweens.add({
       duration: 0.35,
       easing: (t) => t,
-      onUpdate: (t) => { sprite.y = startY + t * t * 260; sprite.alpha = 1 - t; },
-      onComplete: () => sprite.destroy(),
+      onUpdate: (t) => {
+        mesh.position.y = startY - t * t * 260;
+        mesh.material.opacity = 1 - t;
+      },
+      onComplete: () => {
+        this.boardGroup.remove(mesh);
+        mesh.material.dispose();
+      },
     });
   }
 
   // ---------- effects ----------
 
-  _burstParticles(x, y, colorHex, count = 8) {
+  _burstParticles(localPos, colorHex, count = 8) {
     for (let i = 0; i < count; i++) {
       const angle = Math.random() * Math.PI * 2;
       const speed = 80 + Math.random() * 220;
-      const sprite = new Sprite(this.textures.get('dot'));
-      sprite.anchor.set(0.5);
-      sprite.tint = colorHex;
-      const size = 4 + Math.random() * 5;
-      sprite.width = size;
-      sprite.height = size;
-      sprite.position.set(x, y);
-      this.effectsLayer.addChild(sprite);
-      this.particles.push({ sprite, vx: Math.cos(angle) * speed, vy: Math.sin(angle) * speed, life: 1, decay: 1.6 + Math.random() * 1.2 });
+      const material = new THREE.SpriteMaterial({
+        map: this.assets.dotTexture,
+        color: colorHex,
+        transparent: true,
+        depthWrite: false,
+      });
+      const sprite = new THREE.Sprite(material);
+      const size = 6 + Math.random() * 7;
+      sprite.scale.set(size, size, 1);
+      sprite.position.copy(localPos);
+      this.boardGroup.add(sprite);
+      this.particles.push({
+        sprite,
+        vx: Math.cos(angle) * speed,
+        vy: Math.sin(angle) * speed,
+        vz: (Math.random() - 0.5) * 140,
+        life: 1,
+        decay: 1.6 + Math.random() * 1.2,
+      });
     }
   }
 
-  _spawnComboText(x, y, points, combo) {
+  _spawnComboText(worldPos, points, combo) {
     const label = combo > 1 ? `+${points}  x${combo}` : `+${points}`;
-    const text = new Text({
-      text: label,
-      style: { fill: 0xffffff, fontSize: 18, fontWeight: '800', fontFamily: 'sans-serif', stroke: { color: 0x140f24, width: 3 } },
+    const screen = this._worldToScreen(worldPos);
+    const el = document.createElement('div');
+    el.className = 'fx-combo-text';
+    el.textContent = label;
+    el.style.left = `${screen.x}px`;
+    el.style.top = `${screen.y}px`;
+    this.fxLayer.appendChild(el);
+    requestAnimationFrame(() => {
+      el.style.transform = 'translate(-50%, -50%) translateY(-40px)';
+      el.style.opacity = '0';
     });
-    text.anchor.set(0.5);
-    text.position.set(x, y);
-    this.effectsLayer.addChild(text);
-    const startY = y;
-    this.tweens.add({
-      duration: 0.6,
-      onUpdate: (t) => { text.y = lerp(startY, startY - 40, t); text.alpha = 1 - t; },
-      onComplete: () => text.destroy(),
-    });
+    setTimeout(() => el.remove(), 650);
   }
 
   _shake() {
-    const container = this.worldContainer;
+    const group = this.boardGroup;
+    const baseRotX = -TILT_ANGLE;
     this.tweens.add({
       duration: 0.18,
       easing: (t) => t,
       onUpdate: (t) => {
         const decay = 1 - t;
-        container.position.set((Math.random() - 0.5) * 10 * decay, (Math.random() - 0.5) * 10 * decay);
+        group.position.x = (Math.random() - 0.5) * 10 * decay;
+        group.position.y = (Math.random() - 0.5) * 10 * decay;
       },
-      onComplete: () => container.position.set(0, 0),
+      onComplete: () => {
+        group.position.set(0, 0, 0);
+        group.rotation.x = baseRotX;
+      },
     });
   }
 
@@ -399,33 +605,34 @@ export class GameEngine {
 
   _pushNewRow() {
     const rowData = [];
-    for (let c = 0; c < COLS; c++) rowData.push({ color: this._randomColor() });
+    for (let c = 0; c < this.cols; c++) rowData.push({ color: this._randomColor() });
 
-    const oldSprites = this.sprites;
-    this.sprites = new Map();
-    for (const [key, sprite] of oldSprites) {
+    const oldMeshes = this.meshes;
+    this.meshes = new Map();
+    for (const [key, mesh] of oldMeshes) {
       const [r, c] = key.split(',').map(Number);
-      this.sprites.set(`${r + 1},${c}`, sprite);
-      const fromY = sprite.y;
-      const toY = fromY + this.grid.rowHeight;
-      this.tweens.add({ duration: 0.2, onUpdate: (t) => { sprite.y = lerp(fromY, toY, t); } });
+      this.meshes.set(`${r + 1},${c}`, mesh);
+      const fromY = mesh.position.y;
+      const toY = fromY - this.grid.rowHeight;
+      this.tweens.add({ duration: 0.2, onUpdate: (t) => { mesh.position.y = lerp(fromY, toY, t); } });
     }
 
     this.grid.unshiftRow(rowData);
 
-    for (let c = 0; c < COLS; c++) {
-      const sprite = this._createSprite(0, c, rowData[c]);
-      const finalY = sprite.y;
-      const startY = finalY - this.grid.rowHeight;
-      sprite.y = startY;
-      sprite.alpha = 0;
-      sprite.scale.set(0.6);
+    const targetRadius = (this.cellSize - 3) / 2;
+    for (let c = 0; c < this.cols; c++) {
+      const mesh = this._createBubbleMesh(0, c, rowData[c]);
+      const finalY = mesh.position.y;
+      const startY = finalY + this.grid.rowHeight;
+      mesh.position.y = startY;
+      mesh.material.opacity = 0;
+      mesh.scale.setScalar(targetRadius * 0.6);
       this.tweens.add({
         duration: 0.2,
         onUpdate: (t) => {
-          sprite.y = lerp(startY, finalY, t);
-          sprite.alpha = t;
-          sprite.scale.set(lerp(0.6, 1, t));
+          mesh.position.y = lerp(startY, finalY, t);
+          mesh.material.opacity = t;
+          mesh.scale.setScalar(lerp(targetRadius * 0.6, targetRadius, t));
         },
       });
     }
@@ -438,19 +645,22 @@ export class GameEngine {
   _land() {
     const proj = this.projectile;
     this.projectile = null;
-    if (this.projectileSprite) { this.projectileSprite.destroy(); this.projectileSprite = null; }
+    if (this.projectileMesh) {
+      this.boardGroup.remove(this.projectileMesh);
+      this.projectileMesh = null;
+    }
 
     const [r, c] = this.grid.nearestEmptyCell(proj.x, Math.max(proj.y, this.topY + this.cellSize / 2));
     const placed = { color: proj.color, type: proj.type };
     this.grid.set(r, c, placed);
-    const sprite = this._createSprite(r, c, placed);
+    const mesh = this._createBubbleMesh(r, c, placed);
 
-    const targetX = sprite.x;
-    const targetY = sprite.y;
-    sprite.position.set(proj.x, proj.y);
+    const target = mesh.position.clone();
+    const startP = this.pixelToWorld(proj.x, proj.y, mesh.position.z);
+    mesh.position.copy(startP);
     this.tweens.add({
       duration: 0.09,
-      onUpdate: (t) => { sprite.x = lerp(proj.x, targetX, t); sprite.y = lerp(proj.y, targetY, t); },
+      onUpdate: (t) => { mesh.position.lerpVectors(startP, target, t); },
     });
 
     let popped;
@@ -470,14 +680,19 @@ export class GameEngine {
       this.score += gained;
       this.audio.pop(this.combo);
 
-      for (const [pr, pc] of popped) this._popSpriteAt(pr, pc);
-      this._spawnComboText(targetX, targetY, gained, this.combo);
+      for (const [pr, pc] of popped) this._popMeshAt(pr, pc);
+
+      mesh.position.copy(target);
+      const worldPos = new THREE.Vector3();
+      mesh.getWorldPosition(worldPos);
+      mesh.position.copy(startP);
+      this._spawnComboText(worldPos, gained, this.combo);
 
       const floating = dropFloatingBubbles(this.grid);
       if (floating.length) {
         this.bubblesPopped += floating.length;
         this.score += floating.length * 20;
-        for (const [fr, fc] of floating) this._dropSpriteAt(fr, fc);
+        for (const [fr, fc] of floating) this._dropMeshAt(fr, fc);
       }
     } else {
       this.combo = 0;
@@ -525,68 +740,102 @@ export class GameEngine {
 
   // ---------- main loop ----------
 
-  _tick(rawDt) {
+  _frame() {
+    const now = performance.now();
+    const rawDt = (now - this._lastTime) / 1000;
+    this._lastTime = now;
     // Clamp dt so a frame hiccup (tab throttling, a heavy GC pause, slow
     // device) can't let the projectile tunnel through the grid in one step —
     // the collision check only scans a small row window around its position.
     const dt = Math.min(rawDt, 0.032);
+
     this.tweens.update(dt);
     this._updateParticles(dt);
-    this._drawKillLine();
+    this._updateKillLine();
+    this._spinBubbles(dt);
 
-    if (this.state !== 'playing') return;
+    if (this.state === 'playing') {
+      this.timeSinceLastRow += dt * 1000;
+      if (this.timeSinceLastRow >= this.rowInterval) {
+        this.timeSinceLastRow = 0;
+        this._pushNewRow();
+        this._checkGameOver();
+      }
 
-    this.timeSinceLastRow += dt * 1000;
-    if (this.timeSinceLastRow >= this.rowInterval) {
-      this.timeSinceLastRow = 0;
-      this._pushNewRow();
-      this._checkGameOver();
+      if (this.projectile) {
+        const bounds = { left: this.boardLeft, right: this.boardRight, top: this.topY };
+        const hitTop = this.projectile.advance(dt, bounds);
+        if (this.projectileMesh) {
+          this.projectileMesh.position.set(
+            this.projectile.x - this.width / 2,
+            this.height / 2 - this.projectile.y,
+            6
+          );
+        }
+        const hit = hitTop || !!findGridCollision(this.grid, this.projectile);
+        if (hit) this._land();
+      }
+
+      if (this.cannonGroup) this.cannonGroup.rotation.z = -this.aimer.angle;
+      this._updateAimDots();
     }
 
-    if (this.projectile) {
-      const bounds = { left: this.boardLeft, right: this.boardRight, top: this.topY };
-      const hitTop = this.projectile.advance(dt, bounds);
-      if (this.projectileSprite) this.projectileSprite.position.set(this.projectile.x, this.projectile.y);
-      const hit = hitTop || !!findGridCollision(this.grid, this.projectile);
-      if (hit) this._land();
-    }
+    this.renderer.render(this.scene, this.camera);
+  }
 
-    this._drawAimLine();
+  _spinBubbles(dt) {
+    for (const mesh of this.meshes.values()) {
+      mesh.rotation.y += dt * 0.15;
+      mesh.rotation.x += dt * 0.05;
+    }
   }
 
   _updateParticles(dt) {
     for (const p of this.particles) {
-      p.vy += 420 * dt;
-      p.sprite.x += p.vx * dt;
-      p.sprite.y += p.vy * dt;
+      p.vy -= 420 * dt;
+      p.sprite.position.x += p.vx * dt;
+      p.sprite.position.y += p.vy * dt;
+      p.sprite.position.z += p.vz * dt;
       p.life -= p.decay * dt;
-      p.sprite.alpha = Math.max(p.life, 0);
+      p.sprite.material.opacity = Math.max(p.life, 0);
     }
     const dead = this.particles.filter((p) => p.life <= 0);
-    for (const p of dead) p.sprite.destroy();
+    for (const p of dead) {
+      this.boardGroup.remove(p.sprite);
+      p.sprite.material.dispose();
+    }
     this.particles = this.particles.filter((p) => p.life > 0);
   }
 
-  _drawAimLine() {
-    const g = this.aimGraphics;
-    g.clear();
-    if (!this.grid) return;
+  _updateAimDots() {
+    if (!this.grid) {
+      this._aimPoints.geometry.setDrawRange(0, 0);
+      return;
+    }
     const bounds = { left: this.boardLeft, right: this.boardRight, top: this.topY };
     const path = predictBouncePath(this.shooterX, this.shooterY, this.aimer.angle, bounds, this.grid, this.cellSize / 2);
-    for (let i = 0; i < path.length; i += 3) {
-      const p = path[i];
-      g.circle(p.x, p.y, 2.5).fill({ color: 0xffffff, alpha: 0.35 });
+    const halfW = this.width / 2;
+    const halfH = this.height / 2;
+    let count = 0;
+    for (let i = 0; i < path.length && count < AIM_DOT_COUNT; i += 3) {
+      const point = path[i];
+      const base = count * 3;
+      this._aimPositions[base] = point.x - halfW;
+      this._aimPositions[base + 1] = halfH - point.y;
+      this._aimPositions[base + 2] = 3;
+      count++;
     }
+    this._aimPoints.geometry.attributes.position.needsUpdate = true;
+    this._aimPoints.geometry.setDrawRange(0, count);
   }
 
-  _drawKillLine() {
-    const g = this.killLineGraphics;
-    g.clear();
-    if (!this.width) return;
+  _updateKillLine() {
+    if (!this.width || !this.killLineMesh) return;
     const danger = this.state === 'playing' && this._isNearKillLine();
     const alpha = danger ? 0.45 + Math.sin(performance.now() / 140) * 0.25 : 0.22;
-    g.moveTo(0, this.killLineY).lineTo(this.width, this.killLineY)
-      .stroke({ width: 2, color: 0xff5d73, alpha: Math.max(0, Math.min(1, alpha)) });
+    this.killLineMesh.material.opacity = Math.max(0, Math.min(1, alpha));
+    this.killLineMesh.scale.set(this.width, 1, 1);
+    this.killLineMesh.position.set(0, this.height / 2 - this.killLineY, 5);
   }
 
   // ---------- teardown ----------
@@ -595,6 +844,38 @@ export class GameEngine {
     this.destroyed = true;
     if (this._resizeObserver) this._resizeObserver.disconnect();
     if (this._cleanupInput) this._cleanupInput();
-    if (this.app) this.app.destroy(true, { children: true, texture: true });
+
+    if (this.renderer) {
+      this.renderer.setAnimationLoop(null);
+
+      for (const mesh of this.meshes.values()) mesh.material.dispose();
+      for (const p of this.particles) p.sprite.material.dispose();
+      if (this._aimPoints) {
+        this._aimPoints.geometry.dispose();
+        this._aimPoints.material.dispose();
+      }
+      if (this.killLineMesh) {
+        this.killLineMesh.geometry.dispose();
+        this.killLineMesh.material.dispose();
+      }
+      if (this.shadowPlane) {
+        this.shadowPlane.geometry.dispose();
+        this.shadowPlane.material.dispose();
+      }
+      if (this.cannonGroup) {
+        this.cannonGroup.traverse((obj) => {
+          if (obj.geometry) obj.geometry.dispose();
+          if (obj.material) obj.material.dispose();
+        });
+      }
+      if (this.assets) disposeBubbleAssets(this.assets);
+
+      this.renderer.dispose();
+      if (this.renderer.domElement.parentNode) {
+        this.renderer.domElement.parentNode.removeChild(this.renderer.domElement);
+      }
+    }
+
+    if (this.fxLayer && this.fxLayer.parentNode) this.fxLayer.parentNode.removeChild(this.fxLayer);
   }
 }
